@@ -1020,6 +1020,14 @@ function createDOMPurify(window = getGlobal()) {
       typeof elm.namespaceURI !== 'string' ||
       typeof elm.insertBefore !== 'function' ||
       typeof elm.hasChildNodes !== 'function' ||
+      // NodeType clobbering probe. Cached Node.prototype.nodeType getter
+      // returns the integer 1 for any Element regardless of realm; direct
+      // read on a clobbered form (e.g. <input name="nodeType">) returns
+      // the named child element. Cheap addition — nodeType is read from
+      // an internal slot, no serialization cost — and removes a residual
+      // clobbering surface used by several mXSS / PI / comment branches
+      // in _sanitizeElements that compare currentNode.nodeType directly.
+      elm.nodeType !== getNodeType(elm) ||
       // HTMLFormElement has [LegacyOverrideBuiltIns]: a descendant named
       // "childNodes" shadows the prototype getter. Direct reads of
       // form.childNodes from a clobbered form return the named child
@@ -1130,6 +1138,18 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     return set === defaultSet || set === pristineSet ? clone(set) : set;
+  };
+
+  /**
+   * _hasHooks
+   * Check whether at least one hook is registered for an entry point.
+   * The `hooks` object is populated on demand, so the array may be absent.
+   *
+   * @param  {String} entryPoint  Name of the hook's entry point
+   * @return {Boolean} true if a hook is registered for the entry point
+   */
+  const _hasHooks = function (entryPoint) {
+    return Boolean(hooks[entryPoint] && hooks[entryPoint].length > 0);
   };
 
   /**
@@ -1253,10 +1273,17 @@ function createDOMPurify(window = getGlobal()) {
           return false;
       }
 
-      /* Keep content except for bad-listed elements */
+      /* Keep content except for bad-listed elements.
+         Use the cached prototype getters exclusively — the previous code
+         had `|| currentNode.parentNode` / `|| currentNode.childNodes`
+         fallbacks, but the cached getters always return the canonical
+         value (or null for a real parent-less node), so the fallback
+         path was dead in safe cases and a clobbering surface in unsafe
+         ones. Falsy cached results stay falsy; the `if (childNodes &&
+         parentNode)` check already gates correctly. */
       if (KEEP_CONTENT && !FORBID_CONTENTS[tagName]) {
-        const parentNode = getParentNode(currentNode) || currentNode.parentNode;
-        const childNodes = getChildNodes(currentNode) || currentNode.childNodes;
+        const parentNode = getParentNode(currentNode);
+        const childNodes = getChildNodes(currentNode);
 
         if (childNodes && parentNode) {
           const childCount = childNodes.length;
@@ -1690,6 +1717,26 @@ function createDOMPurify(window = getGlobal()) {
       ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
     } else {
       _parseConfig(cfg);
+    }
+
+    /* Clone the hook-mutable allowlists before the walk whenever an
+     * uponSanitize* hook is registered. The hook event exposes ALLOWED_TAGS
+     * and ALLOWED_ATTR by reference (as allowedTags / allowedAttributes), so
+     * a hook that widens them would otherwise mutate the shared set
+     * permanently: across later calls and across every element. Cloning per
+     * walk keeps documented in-call widening working while scoping it to the
+     * call. A single guard for both config paths - the per-call path rebinds
+     * the sets in _parseConfig each call, the persistent path restores them
+     * from the captured bindings just above - so the two cannot diverge. */
+    if (
+      _hasHooks('uponSanitizeElement') ||
+      _hasHooks('uponSanitizeAttribute')
+    ) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (_hasHooks('uponSanitizeAttribute')) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
     }
 
     /* Clean up removed elements */
